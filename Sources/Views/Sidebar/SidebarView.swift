@@ -1,0 +1,317 @@
+import SwiftUI
+
+/// Cities, each with its exploration percentage, plus the places inside the
+/// selected one. Selecting a row drives the map's camera and scope.
+struct SidebarView: View {
+    @Environment(DataStore.self) private var store
+
+    @Binding var selectedCity: String?
+    @Binding var selectedPlaceID: UUID?
+    @Binding var isShowingAddCity: Bool
+    /// Fires on every click of a city row, including a click on the row that is
+    /// already selected — `List`'s selection binding stays silent for those,
+    /// but re-clicking must still restore the city's overview.
+    var onCityActivated: (String) -> Void
+    var onRenameCity: (String, String) -> Void
+    var onDeleteCity: (String) -> Void
+    @Binding var selectedTripID: String?
+    var onTripActivated: (Trip) -> Void
+    var onSelectAll: () -> Void
+
+    @State private var searchText = ""
+    @State private var cityPendingDeletion: String?
+    @State private var cityPendingRename: String?
+    @State private var renameDraft = ""
+
+    private func aggregates(ofKind kind: CityKind) -> [CityAggregate] {
+        let matching = store.cityAggregates(ofKind: kind)
+        guard !searchText.isEmpty else { return matching }
+        return matching.filter { $0.city.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    /// With a search term active, matching places across every city surface
+    /// too — on a Mac the sidebar doubles as the "jump to anything" list.
+    private var trips: [Trip] {
+        guard !searchText.isEmpty else { return store.trips }
+        return store.trips.filter { $0.routeText.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    private var matchingPlaces: [Place] {
+        guard !searchText.isEmpty else { return [] }
+        return store.places.filter {
+            $0.name.localizedCaseInsensitiveContains(searchText)
+                || $0.notes.localizedCaseInsensitiveContains(searchText)
+        }
+    }
+
+    var body: some View {
+        List(selection: $selectedCity) {
+            Section {
+                allPlacesRow
+            }
+
+            // Two sections rather than one flat list: a city you lived in and
+            // a city you spent a weekend in are different kinds of record, and
+            // their exploration percentages aren't comparable.
+            ForEach(CityKind.allCases) { kind in
+                let cities = aggregates(ofKind: kind)
+                if !cities.isEmpty {
+                    Section {
+                        ForEach(cities) { aggregate in
+                            Button {
+                                onCityActivated(aggregate.city)
+                            } label: {
+                                CityRow(aggregate: aggregate, kind: kind)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                            }
+                                .buttonStyle(.plain)
+                                .tag(aggregate.city)
+                                .contextMenu { kindMenu(for: aggregate.city, current: kind) }
+                                .help("点击恢复这座城市的地图总览")
+                        }
+                    } header: {
+                        Label(kind.sectionTitle, systemImage: kind.symbolName)
+                            .font(.system(size: WaymarkType.caption, weight: .semibold))
+                    }
+                }
+            }
+
+            if !trips.isEmpty {
+                Section {
+                    ForEach(trips) { trip in
+                        TripRow(trip: trip, isSelected: trip.id == selectedTripID)
+                            .contentShape(Rectangle())
+                            .onTapGesture { onTripActivated(trip) }
+                            .listRowBackground(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(trip.id == selectedTripID ? Color.accentColor.opacity(0.15) : .clear)
+                            )
+                            .help("点击在地图上按顺序画出这趟行程")
+                    }
+                } header: {
+                    Label("旅行踪迹", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                        .font(.system(size: WaymarkType.caption, weight: .semibold))
+                }
+            }
+
+            if !matchingPlaces.isEmpty {
+                Section("地点") {
+                    ForEach(matchingPlaces) { place in
+                        PlaceSearchRow(place: place)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                selectedCity = place.city.isEmpty ? nil : place.city
+                                selectedPlaceID = place.id
+                            }
+                    }
+                }
+            }
+        }
+        .searchable(text: $searchText, placement: .sidebar, prompt: "搜索城市或地点")
+        .safeAreaInset(edge: .bottom) { footer }
+        .alert(
+            "删除「\(cityPendingDeletion ?? "")」？",
+            isPresented: Binding(get: { cityPendingDeletion != nil }, set: { if !$0 { cityPendingDeletion = nil } })
+        ) {
+            Button("取消", role: .cancel) { cityPendingDeletion = nil }
+            Button("删除", role: .destructive) {
+                if let city = cityPendingDeletion { onDeleteCity(city) }
+                cityPendingDeletion = nil
+            }
+        } message: {
+            // Spell out the damage: deleting a city takes its places, visits
+            // and photos with it, and there is no undo.
+            Text(deletionWarning(for: cityPendingDeletion))
+        }
+        .alert(
+            "重命名「\(cityPendingRename ?? "")」",
+            isPresented: Binding(get: { cityPendingRename != nil }, set: { if !$0 { cityPendingRename = nil } })
+        ) {
+            TextField("城市名称", text: $renameDraft)
+            Button("取消", role: .cancel) { cityPendingRename = nil }
+            Button("保存") {
+                if let city = cityPendingRename { onRenameCity(city, renameDraft) }
+                cityPendingRename = nil
+            }
+        } message: {
+            Text("这座城市下的所有打卡地点都会改到新名字。改成一个已存在的城市名会把两者合并。")
+        }
+    }
+
+    private func deletionWarning(for city: String?) -> String {
+        guard let city else { return "" }
+        let places = store.places(inCity: city)
+        let photos = places.reduce(0) { $0 + $1.photos.count }
+        let visits = places.reduce(0) { $0 + $1.visits.count }
+        return "将删除 \(places.count) 个打卡地点、\(visits) 条到访记录和 \(photos) 张照片，无法撤销。"
+    }
+
+    @ViewBuilder
+    private func kindMenu(for city: String, current: CityKind) -> some View {
+        ForEach(CityKind.allCases) { kind in
+            Button {
+                store.setKind(kind, forCity: city)
+            } label: {
+                Label(
+                    kind == current ? "\(kind.sectionTitle)（当前）" : "移到「\(kind.sectionTitle)」",
+                    systemImage: kind.symbolName
+                )
+            }
+            .disabled(kind == current)
+        }
+
+        Divider()
+
+        Button {
+            renameDraft = city
+            cityPendingRename = city
+        } label: {
+            Label("重命名…", systemImage: "pencil")
+        }
+
+        Button(role: .destructive) {
+            cityPendingDeletion = city
+        } label: {
+            Label("删除城市…", systemImage: "trash")
+        }
+    }
+
+    private var allPlacesRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "globe.asia.australia.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(.white)
+                .frame(width: 26, height: 26)
+                .background(.teal, in: RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("全部打卡点")
+                    .font(.system(size: WaymarkType.body, weight: .semibold))
+                Text("\(store.places.count) 个地点 · \(store.cityAggregates.count) 座城市")
+                    .font(.system(size: WaymarkType.caption))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelectAll)
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(selectedCity == nil && selectedTripID == nil ? Color.accentColor.opacity(0.15) : .clear)
+        )
+    }
+
+    private var footer: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack {
+                Button {
+                    isShowingAddCity = true
+                } label: {
+                    Label("新建城市", systemImage: "plus")
+                        .font(.system(size: WaymarkType.footnote))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Text("\(store.photoCount) 张照片")
+                    .font(.system(size: WaymarkType.caption))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+        }
+        .background(.bar)
+    }
+}
+
+private struct CityRow: View {
+    let aggregate: CityAggregate
+    let kind: CityKind
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: kind.symbolName)
+                .font(.system(size: 12))
+                .foregroundStyle(.white)
+                .frame(width: 26, height: 26)
+                .background(kind.tint, in: RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(aggregate.city)
+                        .font(.system(size: WaymarkType.body, weight: .semibold))
+                    Spacer()
+                    Text("\(aggregate.coveragePercent)%")
+                        .font(.system(size: WaymarkType.footnote, weight: .bold))
+                        .foregroundStyle(CoveragePalette.visited)
+                }
+
+                // The bar is the point of this row: scanning the sidebar
+                // should answer "where have I barely scratched the surface".
+                ProgressView(value: Double(aggregate.coveragePercent), total: 100)
+                    .tint(CoveragePalette.visited)
+                    .controlSize(.mini)
+
+                Text("\(aggregate.placeCount) 个地点 · \(aggregate.photoCount) 张照片")
+                    .font(.system(size: WaymarkType.caption))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+private struct TripRow: View {
+    let trip: Trip
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "figure.walk.motion")
+                .font(.system(size: 12))
+                .foregroundStyle(.white)
+                .frame(width: 26, height: 26)
+                .background(TripPalette.route, in: RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 3) {
+                // The route is the identity of a trip, so it is the headline —
+                // a date range alone wouldn't tell you which journey this was.
+                Text(trip.routeText)
+                    .font(.system(size: WaymarkType.body, weight: .semibold))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("\(trip.dateRangeText) · \(trip.dayCount) 天")
+                    .font(.system(size: WaymarkType.caption))
+                    .foregroundStyle(.secondary)
+                Text("\(trip.placeCount) 个打卡点 · \(trip.photoCount) 张照片")
+                    .font(.system(size: WaymarkType.caption))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+private struct PlaceSearchRow: View {
+    let place: Place
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: place.category.symbolName)
+                .font(.system(size: 11))
+                .foregroundStyle(.white)
+                .frame(width: 20, height: 20)
+                .background(categoryColor(place.category), in: Circle())
+            VStack(alignment: .leading, spacing: 1) {
+                Text(place.name)
+                    .font(.system(size: WaymarkType.body))
+                if !place.subtitle.isEmpty {
+                    Text(place.subtitle)
+                        .font(.system(size: WaymarkType.caption))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 1)
+    }
+}

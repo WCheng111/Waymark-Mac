@@ -1,0 +1,17 @@
+.build/
+.swiftpm/
+dist/
+*.app/
+*.dmg
+*.dSYM/
+.DS_Store
+.env
+.env.*
+*.log
+data.json
+cities.json
+Photos/
+*.sqlite*
+*.db
+tmp/
+.codex/

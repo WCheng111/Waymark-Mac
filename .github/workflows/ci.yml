@@ -1,0 +1,13 @@
+name: macOS build and test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: swift test
+      - name: Package app and verify ad-hoc signature
+        run: ./script/build_and_run.sh --verify
